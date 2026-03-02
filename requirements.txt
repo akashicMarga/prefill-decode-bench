@@ -1,0 +1,17 @@
+# prefill-decode-bench dependencies
+# Install only what you need for your backend.
+
+# ── Apple Silicon (MLX) ──────────────────────────────────────────
+# mlx-lm>=0.19.0
+
+# ── Nvidia GPU (CUDA) ────────────────────────────────────────────
+# torch>=2.1.0          # install from pytorch.org for your CUDA version
+# transformers>=4.40.0
+# accelerate>=0.27.0
+
+# ── Charts (both backends) ───────────────────────────────────────
+# matplotlib>=3.7.0
+
+# ── Concurrency benchmark (MLX backend) ─────────────────────────
+# mlx-whisper>=0.3.0
+# soundfile>=0.12.0     # optional: load real audio files
