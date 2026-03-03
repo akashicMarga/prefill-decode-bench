@@ -28,7 +28,8 @@ def build_prompt(tokenizer, target_tokens: int) -> str:
 
 def print_summary(run: ProfileRun):
     s = run.system
-    w = 64
+    has_hw = any(r.tflops > 0 for r in run.prefill) or any(r.effective_bandwidth_gbs > 0 for r in run.decode)
+    w = 80 if has_hw else 64
     print()
     print("=" * w)
     print(f"  prefill-decode-bench")
@@ -36,28 +37,53 @@ def print_summary(run: ProfileRun):
     print(f"  Chip    : {s.chip}")
     print(f"  Memory  : {s.memory_gb} GB ({s.memory_type})")
     print(f"  Model   : {s.model}")
+    if run.hardware:
+        h = run.hardware
+        print(f"  Params  : {h.model_params_b:.2f}B  ({h.model_size_gb:.2f} GB weights)")
+        if h.theoretical_bandwidth_gbs > 0:
+            print(f"  Peak BW : {h.theoretical_bandwidth_gbs:.0f} GB/s (theoretical)")
     print("=" * w)
 
     print()
     print("PREFILL  (compute-bound — all input tokens processed in parallel)")
-    print(f"  {'Tokens':>8}  {'tok/s':>10}  {'ms':>8}  {'ms/tok':>8}")
-    print("  " + "-" * 42)
-    for r in run.prefill:
-        ms = r.time_seconds * 1000
-        print(
-            f"  {r.actual_tokens:>8}  {r.tokens_per_second:>10.1f}"
-            f"  {ms:>8.0f}  {ms/max(1,r.actual_tokens):>8.2f}"
-        )
+    if has_hw:
+        print(f"  {'Tokens':>8}  {'tok/s':>10}  {'ms':>8}  {'TFLOPS':>8}  {'Peak mem':>10}")
+        print("  " + "-" * 54)
+        for r in run.prefill:
+            ms = r.time_seconds * 1000
+            print(
+                f"  {r.actual_tokens:>8}  {r.tokens_per_second:>10.1f}"
+                f"  {ms:>8.0f}  {r.tflops:>8.2f}  {r.peak_memory_gb:>9.2f}G"
+            )
+    else:
+        print(f"  {'Tokens':>8}  {'tok/s':>10}  {'ms':>8}  {'ms/tok':>8}")
+        print("  " + "-" * 42)
+        for r in run.prefill:
+            ms = r.time_seconds * 1000
+            print(
+                f"  {r.actual_tokens:>8}  {r.tokens_per_second:>10.1f}"
+                f"  {ms:>8.0f}  {ms/max(1,r.actual_tokens):>8.2f}"
+            )
 
     print()
     print("DECODE   (memory-bandwidth-bound — sequential, reads all weights + KV cache per token)")
-    print(f"  {'KV cache':>10}  {'tok/s':>10}  {'ms/tok':>8}")
-    print("  " + "-" * 34)
-    for r in run.decode:
-        print(
-            f"  {r.prefill_tokens:>10}  {r.tokens_per_second:>10.1f}"
-            f"  {r.ms_per_token:>8.1f}"
-        )
+    if has_hw:
+        print(f"  {'KV cache':>10}  {'tok/s':>10}  {'ms/tok':>8}  {'BW GB/s':>9}  {'BW util':>8}  {'Peak mem':>10}")
+        print("  " + "-" * 66)
+        for r in run.decode:
+            print(
+                f"  {r.prefill_tokens:>10}  {r.tokens_per_second:>10.1f}"
+                f"  {r.ms_per_token:>8.1f}  {r.effective_bandwidth_gbs:>9.1f}"
+                f"  {r.bandwidth_utilization_pct:>7.0f}%  {r.peak_memory_gb:>9.2f}G"
+            )
+    else:
+        print(f"  {'KV cache':>10}  {'tok/s':>10}  {'ms/tok':>8}")
+        print("  " + "-" * 34)
+        for r in run.decode:
+            print(
+                f"  {r.prefill_tokens:>10}  {r.tokens_per_second:>10.1f}"
+                f"  {r.ms_per_token:>8.1f}"
+            )
 
     print()
     if run.decode:
@@ -72,4 +98,12 @@ def print_summary(run: ProfileRun):
         else:
             note = "Significant — bandwidth is the bottleneck for long conversations."
         print(f"  {note}")
+
+    if has_hw and run.decode:
+        avg_bw = sum(r.effective_bandwidth_gbs for r in run.decode) / len(run.decode)
+        avg_util = sum(r.bandwidth_utilization_pct for r in run.decode) / len(run.decode)
+        print(f"\n  Avg effective bandwidth: {avg_bw:.1f} GB/s ({avg_util:.0f}% of theoretical)")
+        if run.decode[0].arithmetic_intensity > 0:
+            ai = run.decode[0].arithmetic_intensity
+            print(f"  Arithmetic intensity: {ai:.2f} FLOPs/byte — {'bandwidth-bound' if ai < 10 else 'compute-bound'}")
     print("=" * w)
