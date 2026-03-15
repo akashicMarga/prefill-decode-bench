@@ -1,9 +1,13 @@
 # prefill-decode-bench
 
+A benchmarking framework for studying transformer inference behaviour across
+hardware, focusing on **prefill vs decode phases** for edge AI systems.
+
 Measures **prefill and decode speed** for LLMs and surfaces the
 memory-bandwidth-bound nature of autoregressive inference.
 
-Works on **Apple Silicon via MLX** and **Nvidia GPUs via CUDA**.
+Works on **Apple Silicon via MLX**, **Nvidia GPUs via CUDA**, and
+**any platform via llama.cpp** (GGUF models — CPU, Metal, CUDA, Vulkan).
 Results are saved as JSON and can be plotted and compared across chips.
 
 Companion to: *Running Conversational AI Locally: A Systems View on Memory, Bandwidth, and Hardware Choices*
@@ -16,6 +20,7 @@ Companion to: *Running Conversational AI Locally: A Systems View on Memory, Band
 prefill-decode-bench/
 ├── profiler.py              # entry point — auto-detects backend
 ├── plot_results.py          # visualize and compare results
+├── setup_llamacpp.sh        # one-time build script for llama.cpp
 ├── requirements.txt
 ├── backends/
 │   ├── types.py             # shared dataclasses (ProfileRun, etc.)
@@ -23,8 +28,15 @@ prefill-decode-bench/
 │   ├── mlx/
 │   │   ├── profiler.py      # MLX backend (Apple Silicon)
 │   │   └── benchmark_concurrent.py  # LLM + Whisper contention test
-│   └── cuda/
-│       └── profiler.py      # CUDA backend (Nvidia)
+│   ├── cuda/
+│   │   └── profiler.py      # CUDA backend (Nvidia)
+│   └── llamacpp/
+│       └── profiler.py      # llama.cpp backend (native CLI)
+├── docs/
+│   └── research_log/        # weekly experiment notes and findings
+│       └── week1.md
+├── vendor/
+│   └── llama.cpp/           # built from source (git-ignored)
 └── results/                 # JSON output + charts (git-ignored)
 ```
 
@@ -32,15 +44,27 @@ prefill-decode-bench/
 
 ## Install
 
-**Apple Silicon:**
+**Apple Silicon (MLX — native):**
 ```bash
 pip install mlx-lm matplotlib
 ```
 
-**Nvidia GPU:**
+**Nvidia GPU (CUDA):**
 ```bash
 # Install PyTorch for your CUDA version first: https://pytorch.org
 pip install transformers accelerate matplotlib
+```
+
+**llama.cpp (any platform — GGUF models):**
+```bash
+# One-time: clone and build llama.cpp from source (auto-detects Metal/CUDA)
+./setup_llamacpp.sh
+
+# Optional: pull GGUF models from HuggingFace
+pip install huggingface-hub matplotlib
+
+# Update for new model support (e.g. after a new architecture release)
+./setup_llamacpp.sh --update
 ```
 
 ---
@@ -48,12 +72,24 @@ pip install transformers accelerate matplotlib
 ## Usage
 
 ```bash
-# Auto-detects backend (MLX on Apple Silicon, CUDA on Nvidia)
+# Auto-detects backend (MLX > CUDA > llama.cpp)
 python profiler.py --model mlx-community/Llama-3.2-3B-Instruct-4bit
 
 # Force a specific backend
-python profiler.py --backend mlx  --model mlx-community/Llama-3.2-3B-Instruct-4bit
-python profiler.py --backend cuda --model meta-llama/Llama-3.2-3B-Instruct
+python profiler.py --backend mlx      --model mlx-community/Llama-3.2-3B-Instruct-4bit
+python profiler.py --backend cuda     --model meta-llama/Llama-3.2-3B-Instruct
+python profiler.py --backend llamacpp --model ./models/llama-3.2-3b-q4_k_m.gguf
+
+# llama.cpp with a HuggingFace GGUF repo
+python profiler.py --backend llamacpp \
+    --model unsloth/Qwen3.5-0.8B-GGUF \
+    --gguf-file "*Q4_K_M.gguf"
+
+# llama.cpp CPU-only (no GPU offload)
+python profiler.py --backend llamacpp --model ./models/model.gguf --gpu-layers 0
+
+# llama.cpp with a custom binary path
+python profiler.py --backend llamacpp --model ./models/model.gguf --llamacpp-bin /usr/local/bin/llama-bench
 
 # Save chart to results/
 python profiler.py --model mlx-community/Mistral-7B-Instruct-v0.3-4bit --plot
@@ -196,15 +232,30 @@ Degradation over ~15%: will produce jitter in a speech pipeline.
 | `mistralai/Mistral-7B-Instruct-v0.3` | Standard baseline |
 | `TheBloke/*-GPTQ` | Quantized, lower VRAM |
 
+**llama.cpp (GGUF models — any HuggingFace GGUF repo or local file):**
+
+| Model | Size (Q4_K_M) | Notes |
+|-------|---------------|-------|
+| `unsloth/Qwen3.5-0.8B-GGUF` | ~533 MB | Tiny, fast testing |
+| `bartowski/Llama-3.2-3B-Instruct-GGUF` | ~2 GB | Fast testing, any platform |
+| `bartowski/Mistral-7B-Instruct-v0.3-GGUF` | ~4 GB | Standard baseline |
+| `bartowski/Llama-3.1-8B-Instruct-GGUF` | ~5 GB | Current 8B baseline |
+
+Use `--gguf-file` to select quantization: `*Q2_K.gguf`, `*Q4_K_M.gguf`, `*Q5_K_M.gguf`, `*Q8_0.gguf`
+
+Because llama.cpp is built from source, new model architectures work immediately
+after `./setup_llamacpp.sh --update` — no waiting for pip releases.
+
 ---
 
 ## Notes on timing methodology
 
 - **MLX**: `mx.eval()` is the sync point — MLX is lazy-evaluated, so timing wraps eval() not the function call
 - **CUDA**: `torch.cuda.synchronize()` is the sync point — CUDA ops are async by default
+- **llama.cpp**: native `llama-bench` binary runs as a subprocess — built from source, always latest model support
 - Median across `--runs` runs is used (not mean) to reduce noise from JIT compilation and GC
 - A warmup pass runs before all measurements to trigger kernel compilation
-- Decode uses greedy sampling (argmax) to remove sampling overhead from timing
+- Decode uses greedy sampling (argmax / temp=0) to remove sampling overhead from timing
 - Prefill timing includes KV cache construction — this is the correct measure of time-to-first-token cost
 
 ---
@@ -218,6 +269,8 @@ Open an issue with your JSON output and chip info to share your numbers.
 
 ## Related
 
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) — Inference of LLMs in C/C++
+- [llama-bench](https://github.com/ggml-org/llama.cpp/tree/master/examples/llama-bench) — Native llama.cpp benchmark tool
 - [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework for Apple Silicon
 - [mlx-lm](https://github.com/ml-explore/mlx-examples/tree/main/llms) — LLM inference + finetuning with MLX
 - [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper ASR with MLX

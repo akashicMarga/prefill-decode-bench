@@ -4,16 +4,18 @@ profiler.py
 prefill-decode-bench — entry point.
 
 Measures prefill and decode speed and surfaces the memory-bandwidth-bound
-nature of LLM inference. Works on Apple Silicon via MLX and Nvidia GPUs
-via CUDA (torch + transformers).
+nature of LLM inference. Works on Apple Silicon via MLX, Nvidia GPUs
+via CUDA (torch + transformers), and any platform via llama.cpp (GGUF).
 
 Usage:
     # Auto-detect backend
     python profiler.py --model meta-llama/Llama-3.2-3B-Instruct
 
     # Force a backend
-    python profiler.py --backend mlx  --model mlx-community/Llama-3.2-3B-Instruct-4bit
-    python profiler.py --backend cuda --model meta-llama/Llama-3.2-3B-Instruct
+    python profiler.py --backend mlx      --model mlx-community/Llama-3.2-3B-Instruct-4bit
+    python profiler.py --backend cuda     --model meta-llama/Llama-3.2-3B-Instruct
+    python profiler.py --backend llamacpp --model ./models/model.gguf
+    python profiler.py --backend llamacpp --model unsloth/Qwen3.5-0.8B-GGUF --gguf-file "*Q4_K_M.gguf"
 
     # Save chart
     python profiler.py --model mlx-community/Llama-3.2-3B-Instruct-4bit --plot
@@ -26,11 +28,26 @@ Usage:
 """
 
 import argparse
+import shutil
 import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).parent
+
+
+def _llamacpp_available() -> bool:
+    """Check if llama-bench binary exists (vendor build or $PATH)."""
+    vendor_bin = REPO_ROOT / "vendor" / "llama.cpp" / "build" / "bin" / "llama-bench"
+    if vendor_bin.is_file():
+        return True
+    if shutil.which("llama-bench"):
+        return True
+    return False
 
 
 def detect_backend() -> str:
-    """Return 'mlx' on Apple Silicon, 'cuda' if a CUDA GPU is available."""
+    """Return best available backend: mlx > cuda > llamacpp."""
     try:
         import mlx.core as mx  # noqa: F401
         return "mlx"
@@ -42,9 +59,12 @@ def detect_backend() -> str:
             return "cuda"
     except ImportError:
         pass
+    if _llamacpp_available():
+        return "llamacpp"
     print("No supported backend found.")
     print("  Apple Silicon: pip install mlx-lm")
     print("  Nvidia GPU:    pip install torch transformers accelerate")
+    print("  llama.cpp:     ./setup_llamacpp.sh")
     sys.exit(1)
 
 
@@ -54,7 +74,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
-        "--backend", choices=["mlx", "cuda"], default=None,
+        "--backend", choices=["mlx", "cuda", "llamacpp"], default=None,
         help="Backend to use. Auto-detected if not set.",
     )
     p.add_argument(
@@ -62,7 +82,8 @@ def parse_args():
         help=(
             "Model ID or local path. "
             "MLX: mlx-community/* HuggingFace IDs. "
-            "CUDA: any HuggingFace causal LM."
+            "CUDA: any HuggingFace causal LM. "
+            "llamacpp: HF GGUF repo or local .gguf file."
         ),
     )
     p.add_argument("--runs", type=int, default=3,
@@ -83,6 +104,21 @@ def parse_args():
         default=[64, 256, 512, 1024, 2048],
         help="KV cache sizes (tokens) to sweep for decode.",
     )
+
+    # llama.cpp-specific options
+    p.add_argument(
+        "--gguf-file", default="*Q4_K_M.gguf",
+        help="GGUF filename pattern when loading from HuggingFace (llamacpp).",
+    )
+    p.add_argument(
+        "--gpu-layers", type=int, default=-1,
+        help="Layers to offload to GPU (llamacpp). -1 = all, 0 = CPU only.",
+    )
+    p.add_argument(
+        "--llamacpp-bin", default=None,
+        help="Path to llama-bench binary (llamacpp). Auto-detected if not set.",
+    )
+
     return p.parse_args()
 
 
@@ -91,12 +127,7 @@ def main():
     backend = args.backend or detect_backend()
     print(f"\nBackend: {backend.upper()}")
 
-    if backend == "mlx":
-        from backends.mlx.profiler import run
-    else:
-        from backends.cuda.profiler import run
-
-    run(
+    common = dict(
         model_id=args.model,
         prefill_lengths=args.prefill_lengths,
         decode_kv_sizes=args.decode_kv_sizes,
@@ -105,6 +136,19 @@ def main():
         plot=args.plot,
         output_dir=args.output_dir,
     )
+
+    if backend == "mlx":
+        from backends.mlx.profiler import run
+        run(**common)
+    elif backend == "cuda":
+        from backends.cuda.profiler import run
+        run(**common)
+    elif backend == "llamacpp":
+        from backends.llamacpp.profiler import run
+        run(**common,
+            gguf_file=args.gguf_file,
+            n_gpu_layers=args.gpu_layers,
+            llamacpp_bin=args.llamacpp_bin)
 
 
 if __name__ == "__main__":

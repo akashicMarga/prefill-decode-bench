@@ -9,7 +9,11 @@
 # transformers>=4.40.0
 # accelerate>=0.27.0
 
-# ── Charts (both backends) ───────────────────────────────────────
+# ── llama.cpp (CPU / Metal / CUDA via GGUF) ──────────────────────
+# No pip dependency — built from source via ./setup_llamacpp.sh
+# huggingface-hub>=0.20.0    # optional: pull GGUF models from HuggingFace
+
+# ── Charts (all backends) ────────────────────────────────────────
 # matplotlib>=3.7.0
 
 # ── Concurrency benchmark (MLX backend) ─────────────────────────

@@ -134,6 +134,38 @@ def _get_peak(mx) -> int:
 
 
 # ---------------------------------------------------------------------------
+# VLM language-model wrapper (adapts LanguageModelOutput → raw logits)
+# ---------------------------------------------------------------------------
+
+class _LMAdapter:
+    """Wraps a VLM's language_model so it quacks like an mlx_lm model.
+
+    mlx_lm models return a raw logits tensor from __call__.
+    mlx_vlm language models return LanguageModelOutput(logits=...).
+    This adapter unwraps that so the rest of the profiler works unchanged.
+    """
+
+    def __init__(self, vlm_model):
+        self._lm = vlm_model.language_model
+        self._vlm = vlm_model
+
+    def __call__(self, *args, **kwargs):
+        out = self._lm(*args, **kwargs)
+        return out.logits if hasattr(out, "logits") else out
+
+    def modules(self):
+        return self._lm.modules()
+
+    def parameters(self):
+        return self._lm.parameters()
+
+    def __getattr__(self, name):
+        if name in ("_lm", "_vlm"):
+            raise AttributeError(name)
+        return getattr(self._lm, name)
+
+
+# ---------------------------------------------------------------------------
 # Warmup
 # ---------------------------------------------------------------------------
 
@@ -253,11 +285,41 @@ def _measure_decode(model, tokenizer, mx, make_cache, kv_sizes, decode_tokens, r
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _load_model(model_id, mx):
+    """Load an MLX model, falling back to mlx_vlm for vision-language models."""
+    # Try mlx_lm (text-only) first
+    try:
+        from mlx_lm import load
+        from mlx_lm.models.cache import make_prompt_cache
+        model, tokenizer = load(model_id)
+        return model, tokenizer, make_prompt_cache
+    except (ImportError, ValueError, Exception) as e:
+        mlx_lm_err = e
+
+    # Fall back to mlx_vlm for VLMs
+    try:
+        from mlx_vlm.utils import load_model
+        from mlx_lm.models.cache import make_prompt_cache
+        from transformers import AutoTokenizer
+        from huggingface_hub import snapshot_download
+        from pathlib import Path as _P
+
+        model_path = _P(snapshot_download(model_id))
+        vlm = load_model(model_path)
+        model = _LMAdapter(vlm)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        print(f"  (loaded as VLM via mlx_vlm, using language_model for benchmarking)")
+        return model, tokenizer, make_prompt_cache
+    except Exception as vlm_err:
+        print(f"Failed to load model with mlx_lm: {mlx_lm_err}")
+        print(f"Failed to load model with mlx_vlm: {vlm_err}")
+        print("Install with: pip install mlx-lm  or  pip install mlx-vlm")
+        sys.exit(1)
+
+
 def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, output_dir):
     try:
         import mlx.core as mx
-        from mlx_lm import load
-        from mlx_lm.models.cache import make_prompt_cache
     except ImportError:
         print("MLX not available. Install with: pip install mlx-lm")
         print("Requires Apple Silicon (M1 or later).")
@@ -276,7 +338,7 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
 
     print("Loading model...")
     _reset_peak(mx)
-    model, tokenizer = load(model_id)
+    model, tokenizer, make_prompt_cache = _load_model(model_id, mx)
     mx.eval(model.parameters())
     model_load_mem = _get_peak(mx) / 1e9
 
