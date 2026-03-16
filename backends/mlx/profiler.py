@@ -285,7 +285,21 @@ def _measure_speculative_decode(model, draft_model, tokenizer, mx, kv_sizes,
                                  decode_tokens, runs, num_draft_tokens,
                                  draft_model_id, model_bytes, draft_bytes,
                                  theoretical_bw) -> list[DecodeResult]:
-    from mlx_lm.generate import speculative_generate_step
+    from mlx_lm.models.cache import make_prompt_cache
+    from experiments.speculative_decoding.hybrid_generate import (
+        has_mamba_cache, speculative_generate_hybrid,
+    )
+
+    test_cache = make_prompt_cache(model)
+    use_hybrid = has_mamba_cache(test_cache)
+    del test_cache
+
+    if use_hybrid:
+        print("  (hybrid Mamba+Attention detected — using snapshot-restore speculative decode)")
+        gen_fn = speculative_generate_hybrid
+    else:
+        from mlx_lm.generate import speculative_generate_step
+        gen_fn = speculative_generate_step
 
     results = []
     for kv_len in kv_sizes:
@@ -300,21 +314,34 @@ def _measure_speculative_decode(model, draft_model, tokenizer, mx, kv_sizes,
         for _ in range(runs):
             prompt_ids = mx.array(tokens, dtype=mx.uint32)
 
-            gen = speculative_generate_step(
-                prompt_ids, model, draft_model,
-                num_draft_tokens=num_draft_tokens,
-                max_tokens=decode_tokens,
-            )
-
-            # First token absorbs prefill cost for both models — exclude it
-            first_tok, first_lp, first_draft = next(gen)
-            mx.eval(first_tok)
+            if use_hybrid:
+                gen = gen_fn(
+                    prompt_ids, model, draft_model, mx,
+                    num_draft_tokens=num_draft_tokens,
+                    max_tokens=decode_tokens,
+                )
+                # First yield includes prefill — skip for timing
+                first_tok, first_draft = next(gen)
+            else:
+                gen = gen_fn(
+                    prompt_ids, model, draft_model,
+                    num_draft_tokens=num_draft_tokens,
+                    max_tokens=decode_tokens,
+                )
+                first_tok, first_lp, first_draft = next(gen)
+                if hasattr(first_tok, 'item'):
+                    mx.eval(first_tok) if isinstance(first_tok, mx.array) else None
 
             _reset_peak(mx)
             n_total, n_accepted = 0, 0
             t0 = time.perf_counter()
-            for tok, logprobs, from_draft in gen:
-                mx.eval(tok)
+            for result in gen:
+                if use_hybrid:
+                    tok, from_draft = result
+                else:
+                    tok, logprobs, from_draft = result
+                    if isinstance(tok, mx.array):
+                        mx.eval(tok)
                 n_total += 1
                 if from_draft:
                     n_accepted += 1
