@@ -281,6 +281,82 @@ def _measure_decode(model, tokenizer, mx, make_cache, kv_sizes, decode_tokens, r
     return results
 
 
+def _measure_speculative_decode(model, draft_model, tokenizer, mx, kv_sizes,
+                                 decode_tokens, runs, num_draft_tokens,
+                                 draft_model_id, model_bytes, draft_bytes,
+                                 theoretical_bw) -> list[DecodeResult]:
+    from mlx_lm.generate import speculative_generate_step
+
+    results = []
+    for kv_len in kv_sizes:
+        prompt = build_prompt(tokenizer, kv_len)
+        tokens = tokenizer.encode(prompt)
+        actual_kv = len(tokens)
+
+        times = []
+        peak_mems = []
+        acceptance_rates = []
+        token_counts = []
+        for _ in range(runs):
+            prompt_ids = mx.array(tokens, dtype=mx.uint32)
+
+            gen = speculative_generate_step(
+                prompt_ids, model, draft_model,
+                num_draft_tokens=num_draft_tokens,
+                max_tokens=decode_tokens,
+            )
+
+            # First token absorbs prefill cost for both models — exclude it
+            first_tok, first_lp, first_draft = next(gen)
+            mx.eval(first_tok)
+
+            _reset_peak(mx)
+            n_total, n_accepted = 0, 0
+            t0 = time.perf_counter()
+            for tok, logprobs, from_draft in gen:
+                mx.eval(tok)
+                n_total += 1
+                if from_draft:
+                    n_accepted += 1
+            elapsed = time.perf_counter() - t0
+
+            peak_mems.append(_get_peak(mx))
+            times.append(elapsed)
+            token_counts.append(n_total)
+            acc = n_accepted / max(1, n_total)
+            acceptance_rates.append(acc)
+
+        times.sort()
+        peak_mems.sort()
+        acceptance_rates.sort()
+        mid = len(times) // 2
+        elapsed = times[mid]
+        peak_mem_gb = round(peak_mems[len(peak_mems) // 2] / 1e9, 3)
+        acc_rate = acceptance_rates[len(acceptance_rates) // 2]
+        n_total = token_counts[mid]
+        tps = n_total / elapsed if elapsed > 0 else 0
+        ms_tok = elapsed / max(1, n_total) * 1000
+
+        combined_bytes = model_bytes + draft_bytes
+        eff_bw = round(combined_bytes * tps / 1e9, 2)
+        bw_util = round(eff_bw / theoretical_bw * 100, 1) if theoretical_bw > 0 else 0.0
+
+        results.append(DecodeResult(
+            actual_kv, n_total, round(elapsed, 4), round(tps, 1), round(ms_tok, 1),
+            peak_memory_gb=peak_mem_gb,
+            effective_bandwidth_gbs=eff_bw,
+            bandwidth_utilization_pct=bw_util,
+            speculative=True,
+            draft_model=draft_model_id,
+            num_draft_tokens=num_draft_tokens,
+            acceptance_rate=round(acc_rate, 3),
+        ))
+        print(f"  Spec     KV={actual_kv:>5} tok  →  {tps:6.1f} tok/s  ({ms_tok:.1f} ms/tok)  "
+              f"accept={acc_rate:.0%}  mem={peak_mem_gb:.2f}GB")
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -317,7 +393,8 @@ def _load_model(model_id, mx):
         sys.exit(1)
 
 
-def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, output_dir):
+def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, output_dir,
+        draft_model_id=None, num_draft_tokens=4):
     try:
         import mlx.core as mx
     except ImportError:
@@ -332,6 +409,8 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
     print(f"Chip   : {chip}")
     print(f"Memory : {memory_gb} GB unified")
     print(f"Model  : {model_id}")
+    if draft_model_id:
+        print(f"Draft  : {draft_model_id} ({num_draft_tokens} draft tokens/step)")
     if theoretical_bw > 0:
         print(f"Peak BW: {theoretical_bw} GB/s (theoretical)")
     print()
@@ -351,8 +430,22 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
     print(f"  Weight size: {model_bytes / 1e9:.2f} GB")
     print(f"  KV / token : {kv_bytes_tok / 1024:.1f} KB")
     print(f"  Metal mem  : {model_load_mem:.2f} GB")
-    print()
 
+    draft_model = None
+    draft_bytes = 0
+    if draft_model_id:
+        print(f"\nLoading draft model...")
+        draft_model, draft_tok, _ = _load_model(draft_model_id, mx)
+        mx.eval(draft_model.parameters())
+        draft_bytes = _model_weight_bytes(draft_model)
+        draft_params = _count_params_logical(draft_model)
+        print(f"  Parameters : {draft_params / 1e9:.2f}B (logical)")
+        print(f"  Weight size: {draft_bytes / 1e9:.2f} GB")
+        if hasattr(tokenizer, 'vocab_size') and hasattr(draft_tok, 'vocab_size'):
+            if tokenizer.vocab_size != draft_tok.vocab_size:
+                print(f"WARNING: vocab mismatch — main={tokenizer.vocab_size}, draft={draft_tok.vocab_size}")
+
+    print()
     _warmup(model, tokenizer, mx)
     print()
 
@@ -364,6 +457,16 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
     decode = _measure_decode(model, tokenizer, mx, make_prompt_cache, decode_kv_sizes, decode_tokens, runs,
                              logical_params, model_bytes, kv_bytes_tok, theoretical_bw)
 
+    spec_decode = []
+    if draft_model:
+        print(f"\nSpeculative decode sweep ({len(decode_kv_sizes)} KV sizes, {runs} runs, "
+              f"~{decode_tokens} tokens each, {num_draft_tokens} draft/step)...")
+        spec_decode = _measure_speculative_decode(
+            model, draft_model, tokenizer, mx, decode_kv_sizes,
+            decode_tokens, runs, num_draft_tokens, draft_model_id,
+            model_bytes, draft_bytes, theoretical_bw,
+        )
+
     hw = HardwareMetrics(
         model_size_gb=round(model_bytes / 1e9, 3),
         model_params_b=round(logical_params / 1e9, 3),
@@ -372,7 +475,7 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
     )
 
     system = SystemInfo("mlx", chip, memory_gb, "unified", model_id)
-    profile = ProfileRun(system, prefill, decode, hardware=hw)
+    profile = ProfileRun(system, prefill, decode, hardware=hw, speculative_decode=spec_decode)
 
     print_summary(profile)
 

@@ -67,6 +67,10 @@ class DecodeResult:
     effective_bandwidth_gbs: float = 0.0
     bandwidth_utilization_pct: float = 0.0
     arithmetic_intensity: float = 0.0
+    speculative: bool = False
+    draft_model: str | None = None
+    num_draft_tokens: int = 0
+    acceptance_rate: float = 0.0
 
 
 @dataclass
@@ -83,6 +87,7 @@ class ProfileRun:
     prefill: list[PrefillResult]
     decode: list[DecodeResult]
     hardware: HardwareMetrics | None = None
+    speculative_decode: list[DecodeResult] = field(default_factory=list)
 
     def save(self, output_dir: Path) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -97,6 +102,8 @@ class ProfileRun:
         }
         if self.hardware:
             data["hardware"] = asdict(self.hardware)
+        if self.speculative_decode:
+            data["speculative_decode"] = [asdict(r) for r in self.speculative_decode]
         with open(out_path, "w") as f:
             json.dump(data, f, indent=2)
         return out_path
@@ -108,9 +115,13 @@ class ProfileRun:
         hw = None
         if "hardware" in data:
             hw = HardwareMetrics(**data["hardware"])
+        spec = []
+        if "speculative_decode" in data:
+            spec = [DecodeResult(**r) for r in data["speculative_decode"]]
         return cls(
             system=SystemInfo(**data["system"]),
             prefill=[PrefillResult(**r) for r in data["prefill"]],
             decode=[DecodeResult(**r) for r in data["decode"]],
             hardware=hw,
+            speculative_decode=spec,
         )

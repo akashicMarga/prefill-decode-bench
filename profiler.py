@@ -105,6 +105,16 @@ def parse_args():
         help="KV cache sizes (tokens) to sweep for decode.",
     )
 
+    # Speculative decoding options
+    p.add_argument(
+        "--draft-model", default=None,
+        help="Draft model ID for speculative decoding (MLX only). Same tokenizer required.",
+    )
+    p.add_argument(
+        "--num-draft-tokens", type=int, default=4,
+        help="Draft tokens per speculation step.",
+    )
+
     # llama.cpp-specific options
     p.add_argument(
         "--gguf-file", default="*Q4_K_M.gguf",
@@ -139,7 +149,9 @@ def main():
 
     if backend == "mlx":
         from backends.mlx.profiler import run
-        run(**common)
+        run(**common,
+            draft_model_id=args.draft_model,
+            num_draft_tokens=args.num_draft_tokens)
     elif backend == "cuda":
         from backends.cuda.profiler import run
         run(**common)

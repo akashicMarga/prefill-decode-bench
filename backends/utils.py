@@ -106,4 +106,37 @@ def print_summary(run: ProfileRun):
         if run.decode[0].arithmetic_intensity > 0:
             ai = run.decode[0].arithmetic_intensity
             print(f"  Arithmetic intensity: {ai:.2f} FLOPs/byte — {'bandwidth-bound' if ai < 10 else 'compute-bound'}")
+
+    if run.speculative_decode:
+        spec = run.speculative_decode
+        draft_name = spec[0].draft_model or "?"
+        ndraft = spec[0].num_draft_tokens
+        print()
+        print(f"SPECULATIVE DECODE  (draft: {draft_name}, {ndraft} tokens/step)")
+        print(f"  {'KV cache':>10}  {'tok/s':>10}  {'ms/tok':>8}  {'accept':>8}  {'vs vanilla':>10}")
+        print("  " + "-" * 56)
+
+        vanilla_by_kv = {r.prefill_tokens: r for r in run.decode}
+        for r in spec:
+            vanilla = vanilla_by_kv.get(r.prefill_tokens)
+            speedup = r.tokens_per_second / vanilla.tokens_per_second if vanilla and vanilla.tokens_per_second > 0 else 0
+            speedup_str = f"{speedup:.2f}x" if speedup > 0 else "—"
+            print(
+                f"  {r.prefill_tokens:>10}  {r.tokens_per_second:>10.1f}"
+                f"  {r.ms_per_token:>8.1f}  {r.acceptance_rate:>7.0%}"
+                f"  {speedup_str:>10}"
+            )
+
+        if len(spec) > 0:
+            avg_acc = sum(r.acceptance_rate for r in spec) / len(spec)
+            avg_speedup_parts = []
+            for r in spec:
+                v = vanilla_by_kv.get(r.prefill_tokens)
+                if v and v.tokens_per_second > 0:
+                    avg_speedup_parts.append(r.tokens_per_second / v.tokens_per_second)
+            avg_speedup = sum(avg_speedup_parts) / len(avg_speedup_parts) if avg_speedup_parts else 0
+            print(f"\n  Avg acceptance rate: {avg_acc:.0%}")
+            if avg_speedup > 0:
+                print(f"  Avg speedup vs vanilla decode: {avg_speedup:.2f}x")
+
     print("=" * w)
