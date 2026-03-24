@@ -25,7 +25,7 @@ APPLE_BANDWIDTH_GBS = {
     "Apple M4 Pro": 273.0,
     "Apple M4 Max": 546.0,
     "Apple M5": 120.0,
-    "Apple M5 Pro": 273.0,
+    "Apple M5 Pro": 307.0,
     "Apple M5 Max": 614.0,
 }
 
