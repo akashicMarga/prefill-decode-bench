@@ -88,6 +88,7 @@ class ProfileRun:
     decode: list[DecodeResult]
     hardware: HardwareMetrics | None = None
     speculative_decode: list[DecodeResult] = field(default_factory=list)
+    turboquant_decode: list[DecodeResult] = field(default_factory=list)
 
     def save(self, output_dir: Path) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -104,6 +105,8 @@ class ProfileRun:
             data["hardware"] = asdict(self.hardware)
         if self.speculative_decode:
             data["speculative_decode"] = [asdict(r) for r in self.speculative_decode]
+        if self.turboquant_decode:
+            data["turboquant_decode"] = [asdict(r) for r in self.turboquant_decode]
         with open(out_path, "w") as f:
             json.dump(data, f, indent=2)
         return out_path
@@ -118,10 +121,14 @@ class ProfileRun:
         spec = []
         if "speculative_decode" in data:
             spec = [DecodeResult(**r) for r in data["speculative_decode"]]
+        tq = []
+        if "turboquant_decode" in data:
+            tq = [DecodeResult(**r) for r in data["turboquant_decode"]]
         return cls(
             system=SystemInfo(**data["system"]),
             prefill=[PrefillResult(**r) for r in data["prefill"]],
             decode=[DecodeResult(**r) for r in data["decode"]],
             hardware=hw,
             speculative_decode=spec,
+            turboquant_decode=tq,
         )

@@ -107,6 +107,34 @@ def print_summary(run: ProfileRun):
             ai = run.decode[0].arithmetic_intensity
             print(f"  Arithmetic intensity: {ai:.2f} FLOPs/byte — {'bandwidth-bound' if ai < 10 else 'compute-bound'}")
 
+    if run.turboquant_decode:
+        tq = run.turboquant_decode
+        print()
+        print("TURBOQUANT DECODE  (KV cache quantized with TurboQuant)")
+        if has_hw:
+            print(f"  {'KV cache':>10}  {'tok/s':>10}  {'ms/tok':>8}  {'BW GB/s':>9}  {'BW util':>8}  {'vs normal':>10}")
+            print("  " + "-" * 72)
+        else:
+            print(f"  {'KV cache':>10}  {'tok/s':>10}  {'ms/tok':>8}  {'vs normal':>10}")
+            print("  " + "-" * 46)
+
+        vanilla_by_kv = {r.prefill_tokens: r for r in run.decode}
+        for r in tq:
+            vanilla = vanilla_by_kv.get(r.prefill_tokens)
+            speedup = r.tokens_per_second / vanilla.tokens_per_second if vanilla and vanilla.tokens_per_second > 0 else 0
+            speedup_str = f"{speedup:.2f}x" if speedup > 0 else "—"
+            if has_hw:
+                print(
+                    f"  {r.prefill_tokens:>10}  {r.tokens_per_second:>10.1f}"
+                    f"  {r.ms_per_token:>8.1f}  {r.effective_bandwidth_gbs:>9.1f}"
+                    f"  {r.bandwidth_utilization_pct:>7.0f}%  {speedup_str:>10}"
+                )
+            else:
+                print(
+                    f"  {r.prefill_tokens:>10}  {r.tokens_per_second:>10.1f}"
+                    f"  {r.ms_per_token:>8.1f}  {speedup_str:>10}"
+                )
+
     if run.speculative_decode:
         spec = run.speculative_decode
         draft_name = spec[0].draft_model or "?"

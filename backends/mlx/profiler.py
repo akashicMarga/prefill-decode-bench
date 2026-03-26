@@ -385,6 +385,152 @@ def _measure_speculative_decode(model, draft_model, tokenizer, mx, kv_sizes,
 
 
 # ---------------------------------------------------------------------------
+# TurboQuant decode measurement
+# ---------------------------------------------------------------------------
+
+def _measure_turboquant_decode(model, tokenizer, mx, kv_sizes, decode_tokens, runs,
+                                logical_params, model_bytes, kv_bytes_tok, theoretical_bw,
+                                turboquant_bits) -> list[DecodeResult]:
+    from backends.mlx.turboquant import make_turboquant_cache
+    from mlx_lm.models.cache import make_prompt_cache
+
+    results = []
+    for kv_len in kv_sizes:
+        prompt = build_prompt(tokenizer, kv_len)
+        tokens = tokenizer.encode(prompt)
+        actual_kv = len(tokens)
+
+        times = []
+        peak_mems = []
+        for _ in range(runs):
+            ids = mx.array(tokens)[None]
+            # Prefill into a normal cache first, then transfer to TurboQuant
+            # This mimics the real usage: prefill is fast, decode is quantized
+            normal_cache = make_prompt_cache(model)
+            logits = model(ids, cache=normal_cache)
+            mx.eval(logits)
+
+            # Now create TurboQuant cache and do decode
+            tq_cache = make_turboquant_cache(model, bits=turboquant_bits)
+            # Seed the TurboQuant cache with the prefilled KV data
+            for i, nc in enumerate(normal_cache):
+                if hasattr(nc, 'keys') and nc.keys is not None:
+                    k_state = nc.keys[..., :nc.offset, :]
+                    v_state = nc.values[..., :nc.offset, :]
+                    tq_cache[i].update_and_fetch(k_state, v_state)
+            mx.eval(ids)  # ensure prefill transfer is complete
+
+            last = mx.array([[tokens[-1]]])
+            _reset_peak(mx)
+            t0 = time.perf_counter()
+            for _ in range(decode_tokens):
+                logits = model(last, cache=tq_cache)
+                mx.eval(logits)
+                next_tok = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+                mx.eval(next_tok)
+                last = next_tok
+            elapsed = time.perf_counter() - t0
+            peak_mems.append(_get_peak(mx))
+            times.append(elapsed)
+
+        times.sort()
+        peak_mems.sort()
+        elapsed = times[len(times) // 2]
+        peak_mem_gb = round(peak_mems[len(peak_mems) // 2] / 1e9, 3)
+        tps = decode_tokens / elapsed
+        ms_tok = elapsed / decode_tokens * 1000
+
+        avg_kv_during_decode = actual_kv + decode_tokens // 2
+        # TurboQuant compressed KV bytes per token
+        tq_kv_bytes = kv_bytes_tok * turboquant_bits / 16.0  # ratio vs fp16
+        kv_cache_bytes = tq_kv_bytes * avg_kv_during_decode if tq_kv_bytes > 0 else 0
+        bytes_per_token = model_bytes + kv_cache_bytes
+        eff_bw = round(bytes_per_token * tps / 1e9, 2)
+        bw_util = round(eff_bw / theoretical_bw * 100, 1) if theoretical_bw > 0 else 0.0
+
+        results.append(DecodeResult(
+            actual_kv, decode_tokens, round(elapsed, 4), round(tps, 1), round(ms_tok, 1),
+            peak_memory_gb=peak_mem_gb,
+            effective_bandwidth_gbs=eff_bw,
+            bandwidth_utilization_pct=bw_util,
+        ))
+        compress_ratio = 16.0 / turboquant_bits
+        print(f"  TQ-{turboquant_bits}b KV={actual_kv:>5} tok  →  {tps:6.1f} tok/s  ({ms_tok:.1f} ms/tok)  "
+              f"mem={peak_mem_gb:.2f}GB  BW={eff_bw:.1f}/{theoretical_bw:.0f} GB/s ({bw_util:.0f}%)  "
+              f"compress={compress_ratio:.1f}x")
+
+    return results
+
+
+def _quality_check(model, tokenizer, mx, turboquant_bits):
+    """Generate text with and without TurboQuant to verify output quality."""
+    from mlx_lm.models.cache import make_prompt_cache
+    from backends.mlx.turboquant import make_turboquant_cache
+
+    prompt = "Explain what gravity is in one paragraph:"
+    tokens = tokenizer.encode(prompt)
+    max_gen = 80
+
+    def generate(cache_list, label):
+        ids = mx.array(tokens)[None]
+        logits = model(ids, cache=cache_list)
+        mx.eval(logits)
+        last = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+        mx.eval(last)
+        gen_tokens = [last.item()]
+        for _ in range(max_gen - 1):
+            logits = model(last, cache=cache_list)
+            mx.eval(logits)
+            last = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+            mx.eval(last)
+            gen_tokens.append(last.item())
+            # Stop at EOS
+            if hasattr(tokenizer, 'eos_token_id') and last.item() == tokenizer.eos_token_id:
+                break
+        text = tokenizer.decode(gen_tokens)
+        print(f"\n  [{label}] {text[:300]}")
+        return text
+
+    print("\n--- Quality Check ---")
+    print(f"  Prompt: \"{prompt}\"")
+
+    normal_cache = make_prompt_cache(model)
+    normal_text = generate(normal_cache, "Normal KV")
+
+    tq_cache = make_turboquant_cache(model, bits=turboquant_bits)
+    tq_text = generate(tq_cache, f"TurboQuant {turboquant_bits}-bit")
+
+    # Simple quality metric: check output isn't garbage
+    def is_garbage(text):
+        import re
+        from collections import Counter
+        clean = text.strip()
+        if len(clean) < 10:
+            return True
+        # Normalize: strip punctuation for word-level analysis
+        words = re.findall(r'[a-zA-Z]+', clean.lower())
+        if len(words) < 5:
+            return len(clean) < 20
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.3:
+            return True
+        # Check for dominant single-word repetition
+        if len(words) > 10:
+            most_common_count = Counter(words).most_common(1)[0][1]
+            if most_common_count / len(words) > 0.4:
+                return True
+        return False
+
+    normal_ok = not is_garbage(normal_text)
+    tq_ok = not is_garbage(tq_text)
+    print(f"\n  Normal quality: {'PASS' if normal_ok else 'FAIL (garbage detected)'}")
+    print(f"  TurboQuant quality: {'PASS' if tq_ok else 'FAIL (garbage detected)'}")
+    if not tq_ok:
+        print(f"  WARNING: TurboQuant at {turboquant_bits} bits may be too aggressive for this model.")
+    print("--- End Quality Check ---\n")
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -421,7 +567,7 @@ def _load_model(model_id, mx):
 
 
 def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, output_dir,
-        draft_model_id=None, num_draft_tokens=4):
+        draft_model_id=None, num_draft_tokens=4, turboquant_bits=None):
     try:
         import mlx.core as mx
     except ImportError:
@@ -438,6 +584,8 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
     print(f"Model  : {model_id}")
     if draft_model_id:
         print(f"Draft  : {draft_model_id} ({num_draft_tokens} draft tokens/step)")
+    if turboquant_bits:
+        print(f"TurboQ : {turboquant_bits}-bit KV cache quantization")
     if theoretical_bw > 0:
         print(f"Peak BW: {theoretical_bw} GB/s (theoretical)")
     print()
@@ -494,6 +642,17 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
             model_bytes, draft_bytes, theoretical_bw,
         )
 
+    tq_decode = []
+    if turboquant_bits:
+        print(f"\nTurboQuant {turboquant_bits}-bit decode sweep ({len(decode_kv_sizes)} KV sizes, "
+              f"{runs} runs, {decode_tokens} tokens each)...")
+        tq_decode = _measure_turboquant_decode(
+            model, tokenizer, mx, decode_kv_sizes, decode_tokens, runs,
+            logical_params, model_bytes, kv_bytes_tok, theoretical_bw,
+            turboquant_bits,
+        )
+        _quality_check(model, tokenizer, mx, turboquant_bits)
+
     hw = HardwareMetrics(
         model_size_gb=round(model_bytes / 1e9, 3),
         model_params_b=round(logical_params / 1e9, 3),
@@ -502,7 +661,9 @@ def run(model_id, prefill_lengths, decode_kv_sizes, decode_tokens, runs, plot, o
     )
 
     system = SystemInfo("mlx", chip, memory_gb, "unified", model_id)
-    profile = ProfileRun(system, prefill, decode, hardware=hw, speculative_decode=spec_decode)
+    profile = ProfileRun(system, prefill, decode, hardware=hw,
+                         speculative_decode=spec_decode,
+                         turboquant_decode=tq_decode)
 
     print_summary(profile)
 

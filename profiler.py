@@ -105,6 +105,12 @@ def parse_args():
         help="KV cache sizes (tokens) to sweep for decode.",
     )
 
+    # TurboQuant KV cache quantization
+    p.add_argument(
+        "--turboquant-bits", type=float, default=None,
+        help="Enable TurboQuant KV cache quantization (MLX only). Bits per channel: 2, 2.5, 3, 3.5, or 4.",
+    )
+
     # Speculative decoding options
     p.add_argument(
         "--draft-model", default=None,
@@ -151,7 +157,8 @@ def main():
         from backends.mlx.profiler import run
         run(**common,
             draft_model_id=args.draft_model,
-            num_draft_tokens=args.num_draft_tokens)
+            num_draft_tokens=args.num_draft_tokens,
+            turboquant_bits=args.turboquant_bits)
     elif backend == "cuda":
         from backends.cuda.profiler import run
         run(**common)
